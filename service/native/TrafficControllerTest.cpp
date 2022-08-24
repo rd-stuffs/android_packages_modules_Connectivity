@@ -307,6 +307,7 @@ TEST_F(TrafficControllerTest, TestChangeUidOwnerRule) {
     checkUidOwnerRuleForChain(POWERSAVE, POWERSAVE_MATCH);
     checkUidOwnerRuleForChain(RESTRICTED, RESTRICTED_MATCH);
     checkUidOwnerRuleForChain(LOW_POWER_STANDBY, LOW_POWER_STANDBY_MATCH);
+    checkUidOwnerRuleForChain(LOCKDOWN, LOCKDOWN_VPN_MATCH);
     ASSERT_EQ(-EINVAL, mTc.changeUidOwnerRule(NONE, TEST_UID, ALLOW, ALLOWLIST));
     ASSERT_EQ(-EINVAL, mTc.changeUidOwnerRule(INVALID_CHAIN, TEST_UID, ALLOW, ALLOWLIST));
 }
@@ -491,6 +492,70 @@ TEST_F(TrafficControllerTest, TestUidInterfaceFilteringRulesCoexistWithNewMatche
     checkEachUidValue({10001, 10002}, IIF_MATCH);
 }
 
+TEST_F(TrafficControllerTest, TestAddUidInterfaceFilteringRulesWithWildcard) {
+    // iif=0 is a wildcard
+    int iif = 0;
+    // Add interface rule with wildcard to uids
+    ASSERT_TRUE(isOk(mTc.addUidInterfaceRules(iif, {1000, 1001})));
+    expectUidOwnerMapValues({1000, 1001}, IIF_MATCH, iif);
+}
+
+TEST_F(TrafficControllerTest, TestRemoveUidInterfaceFilteringRulesWithWildcard) {
+    // iif=0 is a wildcard
+    int iif = 0;
+    // Add interface rule with wildcard to two uids
+    ASSERT_TRUE(isOk(mTc.addUidInterfaceRules(iif, {1000, 1001})));
+    expectUidOwnerMapValues({1000, 1001}, IIF_MATCH, iif);
+
+    // Remove interface rule from one of the uids
+    ASSERT_TRUE(isOk(mTc.removeUidInterfaceRules({1000})));
+    expectUidOwnerMapValues({1001}, IIF_MATCH, iif);
+    checkEachUidValue({1001}, IIF_MATCH);
+
+    // Remove interface rule from the remaining uid
+    ASSERT_TRUE(isOk(mTc.removeUidInterfaceRules({1001})));
+    expectMapEmpty(mFakeUidOwnerMap);
+}
+
+TEST_F(TrafficControllerTest, TestUidInterfaceFilteringRulesWithWildcardAndExistingMatches) {
+    // Set up existing DOZABLE_MATCH and POWERSAVE_MATCH rule
+    ASSERT_TRUE(isOk(updateUidOwnerMaps({1000}, DOZABLE_MATCH,
+                                        TrafficController::IptOpInsert)));
+    ASSERT_TRUE(isOk(updateUidOwnerMaps({1000}, POWERSAVE_MATCH,
+                                        TrafficController::IptOpInsert)));
+
+    // iif=0 is a wildcard
+    int iif = 0;
+    // Add interface rule with wildcard to the existing uid
+    ASSERT_TRUE(isOk(mTc.addUidInterfaceRules(iif, {1000})));
+    expectUidOwnerMapValues({1000}, POWERSAVE_MATCH | DOZABLE_MATCH | IIF_MATCH, iif);
+
+    // Remove interface rule with wildcard from the existing uid
+    ASSERT_TRUE(isOk(mTc.removeUidInterfaceRules({1000})));
+    expectUidOwnerMapValues({1000}, POWERSAVE_MATCH | DOZABLE_MATCH, 0);
+}
+
+TEST_F(TrafficControllerTest, TestUidInterfaceFilteringRulesWithWildcardAndNewMatches) {
+    // iif=0 is a wildcard
+    int iif = 0;
+    // Set up existing interface rule with wildcard
+    ASSERT_TRUE(isOk(mTc.addUidInterfaceRules(iif, {1000})));
+
+    // Add DOZABLE_MATCH and POWERSAVE_MATCH rule to the existing uid
+    ASSERT_TRUE(isOk(updateUidOwnerMaps({1000}, DOZABLE_MATCH,
+                                        TrafficController::IptOpInsert)));
+    ASSERT_TRUE(isOk(updateUidOwnerMaps({1000}, POWERSAVE_MATCH,
+                                        TrafficController::IptOpInsert)));
+    expectUidOwnerMapValues({1000}, POWERSAVE_MATCH | DOZABLE_MATCH | IIF_MATCH, iif);
+
+    // Remove DOZABLE_MATCH and POWERSAVE_MATCH rule from the existing uid
+    ASSERT_TRUE(isOk(updateUidOwnerMaps({1000}, DOZABLE_MATCH,
+                                        TrafficController::IptOpDelete)));
+    ASSERT_TRUE(isOk(updateUidOwnerMaps({1000}, POWERSAVE_MATCH,
+                                        TrafficController::IptOpDelete)));
+    expectUidOwnerMapValues({1000}, IIF_MATCH, iif);
+}
+
 TEST_F(TrafficControllerTest, TestGrantInternetPermission) {
     std::vector<uid_t> appUids = {TEST_UID, TEST_UID2, TEST_UID3};
 
@@ -620,7 +685,7 @@ class NetlinkListenerTest : public testing::Test {
                 if (res.ok() || (res.error().code() == ENOENT)) {
                     return Result<void>();
                 }
-                ALOGE("Failed to delete data(cookie = %" PRIu64 "): %s\n", key,
+                ALOGE("Failed to delete data(cookie = %" PRIu64 "): %s", key,
                       strerror(res.error().code()));
             }
             // Move forward to next cookie in the map.

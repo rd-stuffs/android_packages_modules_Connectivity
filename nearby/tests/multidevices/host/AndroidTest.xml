@@ -11,7 +11,17 @@
      limitations under the License.
 -->
 <configuration description="Config for CTS Nearby Mainline multi devices end-to-end test suite">
-    <option name="test-suite-tag" value="cts" />
+    <!-- Only run tests if the device under test is SDK version 33 (Android 13) or above. -->
+    <object type="module_controller"
+            class="com.android.tradefed.testtype.suite.module.Sdk33ModuleController" />
+    <!-- Only run NearbyMultiDevicesTestSuite in MTS if the Nearby Mainline module is installed. -->
+    <object type="module_controller"
+            class="com.android.tradefed.testtype.suite.module.MainlineTestModuleController">
+        <option name="mainline-module-package-name" value="com.google.android.tethering" />
+    </object>
+
+    <option name="test-suite-tag" value="apct" />
+    <option name="test-tag" value="NearbyMultiDevicesTestSuite" />
     <option name="config-descriptor:metadata" key="component" value="wifi" />
     <option name="config-descriptor:metadata" key="parameter" value="not_instant_app" />
     <option name="config-descriptor:metadata" key="parameter" value="not_multi_abi" />
@@ -31,11 +41,6 @@
         <target_preparer class="com.android.tradefed.targetprep.RunCommandTargetPreparer">
             <option name="run-command" value="input keyevent KEYCODE_WAKEUP" />
             <option name="run-command" value="wm dismiss-keyguard" />
-        </target_preparer>
-        <target_preparer class="com.android.tradefed.targetprep.PythonVirtualenvPreparer">
-          <!-- Any python dependencies can be specified and will be installed with pip -->
-          <!-- TODO(b/225958696): Import python dependencies -->
-          <option name="dep-module" value="mobly" />
         </target_preparer>
         <target_preparer class="com.android.tradefed.targetprep.DeviceSetup">
             <option name="force-skip-system-props" value="true" /> <!-- avoid restarting device -->
@@ -124,7 +129,7 @@
 
     <test class="com.android.tradefed.testtype.mobly.MoblyBinaryHostTest">
       <!-- The mobly-par-file-name should match the module name -->
-      <option name="mobly-par-file-name" value="CtsNearbyMultiDevicesTestSuite" />
+      <option name="mobly-par-file-name" value="NearbyMultiDevicesTestSuite" />
       <!-- Timeout limit in milliseconds for all test cases of the python binary -->
       <option name="mobly-test-timeout" value="60000" />
     </test>

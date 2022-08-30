@@ -16,16 +16,19 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
-// Run the tests: atest -v CtsNearbyMultiDevicesTestSuite
+// Run the tests: atest -v NearbyMultiDevicesTestSuite
 // Check go/run-nearby-mainline-e2e for more details.
 python_test_host {
-    name: "CtsNearbyMultiDevicesTestSuite",
+    name: "NearbyMultiDevicesTestSuite",
     main: "suite_main.py",
     srcs: ["*.py"],
-    libs: ["NearbyMultiDevicesHostHelper"],
+    libs: [
+        "NearbyMultiDevicesHostHelper",
+        "mobly",
+    ],
     test_suites: [
-        "cts",
         "general-tests",
+        "mts-tethering",
     ],
     test_options: {
         unit_test: false,
@@ -38,6 +41,15 @@ python_test_host {
         // Package the JSON metadata with the Mobly test.
         "test_data/**/*",
     ],
+    version: {
+        py2: {
+            enabled: false,
+        },
+        py3: {
+            enabled: true,
+            embedded_launcher: true,
+        },
+    },
 }
 
 python_library_host {

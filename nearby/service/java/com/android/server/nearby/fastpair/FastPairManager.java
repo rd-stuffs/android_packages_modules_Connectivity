@@ -16,6 +16,9 @@
 
 package com.android.server.nearby.fastpair;
 
+import static com.android.server.nearby.common.bluetooth.fastpair.FastPairConstants.EXTRA_MODEL_ID;
+import static com.android.server.nearby.fastpair.Constant.ACTION_FAST_PAIR_HALF_SHEET_BAN_STATE_RESET;
+import static com.android.server.nearby.fastpair.Constant.ACTION_FAST_PAIR_HALF_SHEET_CANCEL;
 import static com.android.server.nearby.fastpair.Constant.TAG;
 
 import android.annotation.Nullable;
@@ -103,13 +106,43 @@ public class FastPairManager {
     private final BroadcastReceiver mScreenBroadcastReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (intent.getAction().equals(Intent.ACTION_SCREEN_ON)
-                    || intent.getAction().equals(Intent.ACTION_BOOT_COMPLETED)) {
-                Log.d(TAG, "onReceive: ACTION_SCREEN_ON or boot complete.");
-                invalidateScan();
-            } else if (intent.getAction().equals(BluetoothDevice.ACTION_BOND_STATE_CHANGED)) {
-                processBluetoothConnectionEvent(intent);
+            String action = intent.getAction();
+            switch (action) {
+                case Intent.ACTION_SCREEN_ON:
+                    Log.d(TAG, "onReceive: ACTION_SCREEN_ON");
+                    invalidateScan();
+                    break;
+                case Intent.ACTION_BOOT_COMPLETED:
+                    Log.d(TAG, "onReceive: ACTION_BOOT_COMPLETED.");
+                    invalidateScan();
+                    break;
+                case BluetoothDevice.ACTION_BOND_STATE_CHANGED:
+                    Log.d(TAG, "onReceive: ACTION_BOND_STATE_CHANGED");
+                    processBluetoothConnectionEvent(intent);
+                    break;
+                case ACTION_FAST_PAIR_HALF_SHEET_BAN_STATE_RESET:
+                    Log.d(TAG, "onReceive: ACTION_FAST_PAIR_HALF_SHEET_BAN_STATE_RESET");
+                    String deviceModelId = intent.getStringExtra(EXTRA_MODEL_ID);
+                    if (deviceModelId == null) {
+                        Log.d(TAG, "HalfSheetManager reset device ban state skipped, "
+                                + "deviceModelId not found");
+                        break;
+                    }
+                    Locator.get(mLocatorContextWrapper, FastPairHalfSheetManager.class)
+                            .resetBanState(deviceModelId);
+                    break;
+                case ACTION_FAST_PAIR_HALF_SHEET_CANCEL:
+                    Log.d(TAG, "onReceive: ACTION_FAST_PAIR_HALF_SHEET_CANCEL");
+                    String modelId = intent.getStringExtra(EXTRA_MODEL_ID);
+                    if (modelId == null) {
+                        Log.d(TAG, "skip half sheet cancel action, model id not found");
+                        break;
+                    }
+                    Locator.get(mLocatorContextWrapper, FastPairHalfSheetManager.class)
+                            .dismiss(modelId);
+
             }
+
         }
     };
 
@@ -151,13 +184,15 @@ public class FastPairManager {
         mIntentFilter.addAction(Intent.ACTION_SCREEN_OFF);
         mIntentFilter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
         mIntentFilter.addAction(Intent.ACTION_BOOT_COMPLETED);
+        mIntentFilter.addAction(ACTION_FAST_PAIR_HALF_SHEET_CANCEL);
+        mIntentFilter.addAction(ACTION_FAST_PAIR_HALF_SHEET_BAN_STATE_RESET);
 
         mLocatorContextWrapper.getContext()
                 .registerReceiver(mScreenBroadcastReceiver, mIntentFilter);
 
         Locator.getFromContextWrapper(mLocatorContextWrapper, FastPairCacheManager.class);
         // Default false for now.
-        mScanEnabled = NearbyManager.getFastPairScanEnabled(mLocatorContextWrapper.getContext());
+        mScanEnabled = NearbyManager.isFastPairScanEnabled(mLocatorContextWrapper.getContext());
         registerFastPairScanChangeContentObserver(mLocatorContextWrapper.getContentResolver());
     }
 
@@ -354,12 +389,15 @@ public class FastPairManager {
     }
 
     private void registerFastPairScanChangeContentObserver(ContentResolver resolver) {
+        if (mFastPairScanChangeContentObserver != null) {
+            unregisterFastPairScanChangeContentObserver(resolver);
+        }
         mFastPairScanChangeContentObserver = new ContentObserver(ForegroundThread.getHandler()) {
             @Override
             public void onChange(boolean selfChange, Uri uri) {
                 super.onChange(selfChange, uri);
                 setScanEnabled(
-                        NearbyManager.getFastPairScanEnabled(mLocatorContextWrapper.getContext()));
+                        NearbyManager.isFastPairScanEnabled(mLocatorContextWrapper.getContext()));
             }
         };
         try {
@@ -369,6 +407,15 @@ public class FastPairManager {
                     mFastPairScanChangeContentObserver);
         } catch (SecurityException e) {
             Log.e(TAG, "Failed to register content observer for fast pair scan.", e);
+        }
+    }
+
+    private void unregisterFastPairScanChangeContentObserver(ContentResolver resolver) {
+        try {
+            resolver.unregisterContentObserver(mFastPairScanChangeContentObserver);
+            mFastPairScanChangeContentObserver = null;
+        } catch (SecurityException | NullPointerException | IllegalArgumentException e) {
+            Log.w(TAG, "Failed to unregister FastPairScanChange content observer.", e);
         }
     }
 

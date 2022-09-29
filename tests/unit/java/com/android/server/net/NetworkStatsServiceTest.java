@@ -25,6 +25,7 @@ import static android.content.Intent.EXTRA_UID;
 import static android.content.pm.PackageManager.PERMISSION_DENIED;
 import static android.content.pm.PackageManager.PERMISSION_GRANTED;
 import static android.net.ConnectivityManager.TYPE_MOBILE;
+import static android.net.ConnectivityManager.TYPE_TEST;
 import static android.net.ConnectivityManager.TYPE_WIFI;
 import static android.net.NetworkIdentity.OEM_PAID;
 import static android.net.NetworkIdentity.OEM_PRIVATE;
@@ -48,6 +49,7 @@ import static android.net.NetworkStats.TAG_NONE;
 import static android.net.NetworkStats.UID_ALL;
 import static android.net.NetworkStatsHistory.FIELD_ALL;
 import static android.net.NetworkTemplate.MATCH_MOBILE;
+import static android.net.NetworkTemplate.MATCH_TEST;
 import static android.net.NetworkTemplate.MATCH_WIFI;
 import static android.net.NetworkTemplate.OEM_MANAGED_NO;
 import static android.net.NetworkTemplate.OEM_MANAGED_YES;
@@ -84,8 +86,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 import android.annotation.NonNull;
 import android.app.AlarmManager;
@@ -107,6 +109,7 @@ import android.net.NetworkStatsCollection;
 import android.net.NetworkStatsHistory;
 import android.net.NetworkTemplate;
 import android.net.TelephonyNetworkSpecifier;
+import android.net.TestNetworkSpecifier;
 import android.net.TetherStatsParcel;
 import android.net.TetheringManager;
 import android.net.UnderlyingNetworkInfo;
@@ -121,6 +124,7 @@ import android.os.SimpleClock;
 import android.provider.Settings;
 import android.system.ErrnoException;
 import android.telephony.TelephonyManager;
+import android.text.TextUtils;
 import android.util.ArrayMap;
 import android.util.Pair;
 
@@ -172,6 +176,7 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -209,9 +214,11 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
     private static final Network WIFI_NETWORK =  new Network(100);
     private static final Network MOBILE_NETWORK =  new Network(101);
     private static final Network VPN_NETWORK = new Network(102);
+    private static final Network TEST_NETWORK = new Network(103);
 
     private static final Network[] NETWORKS_WIFI = new Network[]{ WIFI_NETWORK };
     private static final Network[] NETWORKS_MOBILE = new Network[]{ MOBILE_NETWORK };
+    private static final Network[] NETWORKS_TEST = new Network[]{ TEST_NETWORK };
 
     private static final long WAIT_TIMEOUT = 2 * 1000;  // 2 secs
     private static final int INVALID_TYPE = -1;
@@ -336,9 +343,9 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
 
         final Context context = InstrumentationRegistry.getContext();
         mServiceContext = new MockContext(context);
-        when(mLocationPermissionChecker.checkCallersLocationPermission(
-                any(), any(), anyInt(), anyBoolean(), any())).thenReturn(true);
-        when(sWifiInfo.getNetworkKey()).thenReturn(TEST_WIFI_NETWORK_KEY);
+        doReturn(true).when(mLocationPermissionChecker).checkCallersLocationPermission(
+                any(), any(), anyInt(), anyBoolean(), any());
+        doReturn(TEST_WIFI_NETWORK_KEY).when(sWifiInfo).getNetworkKey();
         mStatsDir = TestIoUtils.createTemporaryDirectory(getClass().getSimpleName());
         mLegacyStatsDir = TestIoUtils.createTemporaryDirectory(
                 getClass().getSimpleName() + "-legacy");
@@ -817,7 +824,6 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
         assertUidTotal(sTemplateWifi, UID_BLUE, 4096L, 258L, 512L, 32L, 0);
         assertUidTotal(sTemplateWifi, UID_GREEN, 16L, 1L, 16L, 1L, 0);
 
-
         // now pretend two UIDs are uninstalled, which should migrate stats to
         // special "removed" bucket.
         mockDefaultSettings();
@@ -940,8 +946,10 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
 
         // Pretend that 5g mobile network comes online
         final NetworkStateSnapshot[] mobileStates =
-                new NetworkStateSnapshot[] {buildMobileState(IMSI_1), buildMobileState(TEST_IFACE2,
-                IMSI_1, true /* isTemporarilyNotMetered */, false /* isRoaming */)};
+                new NetworkStateSnapshot[] {buildMobileState(IMSI_1), buildStateOfTransport(
+                        NetworkCapabilities.TRANSPORT_CELLULAR, TYPE_MOBILE,
+                        TEST_IFACE2, IMSI_1, null /* wifiNetworkKey */,
+                        true /* isTemporarilyNotMetered */, false /* isRoaming */)};
         setMobileRatTypeAndWaitForIdle(TelephonyManager.NETWORK_TYPE_NR);
         mService.notifyNetworkStatus(NETWORKS_MOBILE, mobileStates,
                 getActiveIface(mobileStates), new UnderlyingNetworkInfo[0]);
@@ -1070,8 +1078,8 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
 
     // TODO: support per IMSI state
     private void setMobileRatTypeAndWaitForIdle(int ratType) {
-        when(mNetworkStatsSubscriptionsMonitor.getRatTypeForSubscriberId(anyString()))
-                .thenReturn(ratType);
+        doReturn(ratType).when(mNetworkStatsSubscriptionsMonitor)
+                .getRatTypeForSubscriberId(anyString());
         mService.handleOnCollapsedRatTypeChanged();
         HandlerUtils.waitForIdle(mHandlerThread, WAIT_TIMEOUT);
     }
@@ -1170,6 +1178,41 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
         // For getHistoryIntervalForNetwork, only includes buckets that atomically occur in
         // the inclusive time range, instead of including the latest bucket. This behavior is
         // already documented publicly, refer to {@link NetworkStatsManager#queryDetails}.
+    }
+
+    @Test
+    public void testQueryTestNetworkUsage() throws Exception {
+        final NetworkTemplate templateTestAll = new NetworkTemplate.Builder(MATCH_TEST).build();
+        final NetworkTemplate templateTestIface1 = new NetworkTemplate.Builder(MATCH_TEST)
+                .setWifiNetworkKeys(Set.of(TEST_IFACE)).build();
+        final NetworkTemplate templateTestIface2 = new NetworkTemplate.Builder(MATCH_TEST)
+                .setWifiNetworkKeys(Set.of(TEST_IFACE2)).build();
+        // Test networks might use interface as subscriberId to identify individual networks.
+        // Simulate both cases.
+        final NetworkStateSnapshot[] states =
+                new NetworkStateSnapshot[]{buildTestState(TEST_IFACE, TEST_IFACE),
+                        buildTestState(TEST_IFACE2, null /* wifiNetworkKey */)};
+
+        // Test networks comes online.
+        mockNetworkStatsSummary(buildEmptyStats());
+        mockNetworkStatsUidDetail(buildEmptyStats());
+        mService.notifyNetworkStatus(NETWORKS_TEST, states, getActiveIface(states),
+                new UnderlyingNetworkInfo[0]);
+
+        // Create some traffic on both interfaces.
+        incrementCurrentTime(MINUTE_IN_MILLIS);
+        mockNetworkStatsUidDetail(new NetworkStats(getElapsedRealtime(), 1)
+                .addEntry(new NetworkStats.Entry(TEST_IFACE, UID_RED, SET_DEFAULT, TAG_NONE,
+                        METERED_NO, ROAMING_NO, DEFAULT_NETWORK_NO, 12L, 18L, 14L, 1L, 0L))
+                .addEntry(new NetworkStats.Entry(TEST_IFACE2, UID_RED, SET_DEFAULT, TAG_NONE,
+                        METERED_NO, ROAMING_NO, DEFAULT_NETWORK_NO, 7L, 3L, 5L, 1L, 1L)));
+        forcePollAndWaitForIdle();
+
+        // Verify test network templates gets stats. Stats of test networks without subscriberId
+        // can only be matched by templates without subscriberId requirement.
+        assertUidTotal(templateTestAll, UID_RED, 19L, 21L, 19L, 2L, 1);
+        assertUidTotal(templateTestIface1, UID_RED, 12L, 18L, 14L, 1L, 0);
+        assertUidTotal(templateTestIface2, UID_RED, 0L, 0L, 0L, 0L, 0);
     }
 
     @Test
@@ -1319,8 +1362,10 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
         // pretend that network comes online
         mockDefaultSettings();
         NetworkStateSnapshot[] states =
-            new NetworkStateSnapshot[] {buildMobileState(TEST_IFACE, IMSI_1,
-            false /* isTemporarilyNotMetered */, true /* isRoaming */)};
+            new NetworkStateSnapshot[] {buildStateOfTransport(
+                    NetworkCapabilities.TRANSPORT_CELLULAR, TYPE_MOBILE,
+                    TEST_IFACE,  IMSI_1, null /* wifiNetworkKey */,
+                    false /* isTemporarilyNotMetered */, true /* isRoaming */)};
         mockNetworkStatsSummary(buildEmptyStats());
         mockNetworkStatsUidDetail(buildEmptyStats());
 
@@ -1478,8 +1523,8 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
         mUsageCallback.expectOnThresholdReached(request);
 
         // Allow binder to disconnect
-        when(mUsageCallbackBinder.unlinkToDeath(any(IBinder.DeathRecipient.class), anyInt()))
-                .thenReturn(true);
+        doReturn(true).when(mUsageCallbackBinder)
+                .unlinkToDeath(any(IBinder.DeathRecipient.class), anyInt());
 
         // Unregister request
         mService.unregisterUsageRequest(request);
@@ -1661,7 +1706,7 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
     }
 
     private void setCombineSubtypeEnabled(boolean enable) {
-        when(mSettings.getCombineSubtypeEnabled()).thenReturn(enable);
+        doReturn(enable).when(mSettings).getCombineSubtypeEnabled();
         mHandler.post(() -> mContentObserver.onChange(false, Settings.Global
                     .getUriFor(Settings.Global.NETSTATS_COMBINE_SUBTYPE_ENABLED)));
         waitForIdle();
@@ -1821,8 +1866,8 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
      */
     @Test
     public void testEnforceTemplateLocationPermission() throws Exception {
-        when(mLocationPermissionChecker.checkCallersLocationPermission(
-                any(), any(), anyInt(), anyBoolean(), any())).thenReturn(false);
+        doReturn(false).when(mLocationPermissionChecker)
+                .checkCallersLocationPermission(any(), any(), anyInt(), anyBoolean(), any());
         initWifiStats(buildWifiState(true, TEST_IFACE, IMSI_1));
         assertThrows(SecurityException.class, () ->
                 assertNetworkTotal(sTemplateWifi, 0L, 0L, 0L, 0L, 0));
@@ -1830,8 +1875,8 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
         assertNetworkTotal(sTemplateCarrierWifi1, 0L, 0L, 0L, 0L, 0);
         assertNetworkTotal(sTemplateImsi1, 0L, 0L, 0L, 0L, 0);
 
-        when(mLocationPermissionChecker.checkCallersLocationPermission(
-                any(), any(), anyInt(), anyBoolean(), any())).thenReturn(true);
+        doReturn(true).when(mLocationPermissionChecker)
+                .checkCallersLocationPermission(any(), any(), anyInt(), anyBoolean(), any());
         assertNetworkTotal(sTemplateCarrierWifi1, 0L, 0L, 0L, 0L, 0);
         assertNetworkTotal(sTemplateWifi, 0L, 0L, 0L, 0L, 0);
         assertNetworkTotal(sTemplateImsi1, 0L, 0L, 0L, 0L, 0);
@@ -2027,6 +2072,59 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
         }
     }
 
+    @Test
+    public void testStatsFactoryRemoveUids() throws Exception {
+        // pretend that network comes online
+        mockDefaultSettings();
+        NetworkStateSnapshot[] states = new NetworkStateSnapshot[] {buildWifiState()};
+        mockNetworkStatsSummary(buildEmptyStats());
+        mockNetworkStatsUidDetail(buildEmptyStats());
+
+        mService.notifyNetworkStatus(NETWORKS_WIFI, states, getActiveIface(states),
+                new UnderlyingNetworkInfo[0]);
+
+        // Create some traffic
+        incrementCurrentTime(HOUR_IN_MILLIS);
+        mockDefaultSettings();
+        final NetworkStats stats = new NetworkStats(getElapsedRealtime(), 1)
+                .insertEntry(TEST_IFACE, UID_RED, SET_DEFAULT, TAG_NONE, 16L, 1L, 16L, 1L, 0L)
+                .insertEntry(TEST_IFACE, UID_BLUE, SET_DEFAULT, TAG_NONE,
+                        4096L, 258L, 512L, 32L, 0L)
+                .insertEntry(TEST_IFACE, UID_GREEN, SET_DEFAULT, TAG_NONE, 64L, 3L, 1024L, 8L, 0L);
+        mockNetworkStatsUidDetail(stats);
+
+        forcePollAndWaitForIdle();
+
+        // Verify service recorded history
+        assertUidTotal(sTemplateWifi, UID_RED, 16L, 1L, 16L, 1L, 0);
+        assertUidTotal(sTemplateWifi, UID_BLUE, 4096L, 258L, 512L, 32L, 0);
+        assertUidTotal(sTemplateWifi, UID_GREEN, 64L, 3L, 1024L, 8L, 0);
+
+        // Simulate that the apps are removed.
+        final Intent intentBlue = new Intent(ACTION_UID_REMOVED);
+        intentBlue.putExtra(EXTRA_UID, UID_BLUE);
+        mServiceContext.sendBroadcast(intentBlue);
+
+        final Intent intentRed = new Intent(ACTION_UID_REMOVED);
+        intentRed.putExtra(EXTRA_UID, UID_RED);
+        mServiceContext.sendBroadcast(intentRed);
+
+        final int[] removedUids = {UID_BLUE, UID_RED};
+
+        final ArgumentCaptor<int[]> removedUidsCaptor = ArgumentCaptor.forClass(int[].class);
+        verify(mStatsFactory, times(2)).removeUidsLocked(removedUidsCaptor.capture());
+        final List<int[]> captureRemovedUids = removedUidsCaptor.getAllValues();
+        // Simulate that the stats are removed in NetworkStatsFactory.
+        if (captureRemovedUids.contains(removedUids)) {
+            stats.removeUids(removedUids);
+        }
+
+        // Verify the stats of the removed uid is removed.
+        assertUidTotal(sTemplateWifi, UID_RED, 0L, 0L, 0L, 0L, 0);
+        assertUidTotal(sTemplateWifi, UID_BLUE, 0L, 0L, 0L, 0L, 0);
+        assertUidTotal(sTemplateWifi, UID_GREEN, 64L, 3L, 1024L, 8L, 0);
+    }
+
     private void assertShouldRunComparison(boolean expected, boolean isDebuggable) {
         assertEquals("shouldRunComparison (debuggable=" + isDebuggable + "): ",
                 expected, mService.shouldRunComparison());
@@ -2106,11 +2204,11 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
     }
 
     private void mockNetworkStatsSummaryDev(NetworkStats summary) throws Exception {
-        when(mStatsFactory.readNetworkStatsSummaryDev()).thenReturn(summary);
+        doReturn(summary).when(mStatsFactory).readNetworkStatsSummaryDev();
     }
 
     private void mockNetworkStatsSummaryXt(NetworkStats summary) throws Exception {
-        when(mStatsFactory.readNetworkStatsSummaryXt()).thenReturn(summary);
+        doReturn(summary).when(mStatsFactory).readNetworkStatsSummaryXt();
     }
 
     private void mockNetworkStatsUidDetail(NetworkStats detail) throws Exception {
@@ -2120,11 +2218,11 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
 
     private void mockNetworkStatsUidDetail(NetworkStats detail,
             TetherStatsParcel[] tetherStatsParcels) throws Exception {
-        when(mStatsFactory.readNetworkStatsDetail(UID_ALL, INTERFACES_ALL, TAG_ALL))
-                .thenReturn(detail);
+        doReturn(detail).when(mStatsFactory)
+                .readNetworkStatsDetail(UID_ALL, INTERFACES_ALL, TAG_ALL);
 
         // also include tethering details, since they are folded into UID
-        when(mNetd.tetherGetStats()).thenReturn(tetherStatsParcels);
+        doReturn(tetherStatsParcels).when(mNetd).tetherGetStats();
     }
 
     private void mockDefaultSettings() throws Exception {
@@ -2132,22 +2230,22 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
     }
 
     private void mockSettings(long bucketDuration, long deleteAge) throws Exception {
-        when(mSettings.getPollInterval()).thenReturn(HOUR_IN_MILLIS);
-        when(mSettings.getPollDelay()).thenReturn(0L);
-        when(mSettings.getSampleEnabled()).thenReturn(true);
-        when(mSettings.getCombineSubtypeEnabled()).thenReturn(false);
+        doReturn(HOUR_IN_MILLIS).when(mSettings).getPollInterval();
+        doReturn(0L).when(mSettings).getPollDelay();
+        doReturn(true).when(mSettings).getSampleEnabled();
+        doReturn(false).when(mSettings).getCombineSubtypeEnabled();
 
         final Config config = new Config(bucketDuration, deleteAge, deleteAge);
-        when(mSettings.getDevConfig()).thenReturn(config);
-        when(mSettings.getXtConfig()).thenReturn(config);
-        when(mSettings.getUidConfig()).thenReturn(config);
-        when(mSettings.getUidTagConfig()).thenReturn(config);
+        doReturn(config).when(mSettings).getDevConfig();
+        doReturn(config).when(mSettings).getXtConfig();
+        doReturn(config).when(mSettings).getUidConfig();
+        doReturn(config).when(mSettings).getUidTagConfig();
 
-        when(mSettings.getGlobalAlertBytes(anyLong())).thenReturn(MB_IN_BYTES);
-        when(mSettings.getDevPersistBytes(anyLong())).thenReturn(MB_IN_BYTES);
-        when(mSettings.getXtPersistBytes(anyLong())).thenReturn(MB_IN_BYTES);
-        when(mSettings.getUidPersistBytes(anyLong())).thenReturn(MB_IN_BYTES);
-        when(mSettings.getUidTagPersistBytes(anyLong())).thenReturn(MB_IN_BYTES);
+        doReturn(MB_IN_BYTES).when(mSettings).getGlobalAlertBytes(anyLong());
+        doReturn(MB_IN_BYTES).when(mSettings).getDevPersistBytes(anyLong());
+        doReturn(MB_IN_BYTES).when(mSettings).getXtPersistBytes(anyLong());
+        doReturn(MB_IN_BYTES).when(mSettings).getUidPersistBytes(anyLong());
+        doReturn(MB_IN_BYTES).when(mSettings).getUidTagPersistBytes(anyLong());
     }
 
     private void assertStatsFilesExist(boolean exist) {
@@ -2189,24 +2287,34 @@ public class NetworkStatsServiceTest extends NetworkStatsBaseTest {
     }
 
     private static NetworkStateSnapshot buildMobileState(String subscriberId) {
-        return buildMobileState(TEST_IFACE, subscriberId, false /* isTemporarilyNotMetered */,
-                false /* isRoaming */);
+        return buildStateOfTransport(NetworkCapabilities.TRANSPORT_CELLULAR, TYPE_MOBILE,
+                TEST_IFACE, subscriberId, null /* wifiNetworkKey */,
+                false /* isTemporarilyNotMetered */, false /* isRoaming */);
     }
 
-    private static NetworkStateSnapshot buildMobileState(String iface, String subscriberId,
+    private static NetworkStateSnapshot buildTestState(@NonNull String iface,
+            @Nullable String wifiNetworkKey) {
+        return buildStateOfTransport(NetworkCapabilities.TRANSPORT_TEST, TYPE_TEST,
+                iface, null /* subscriberId */, wifiNetworkKey,
+                false /* isTemporarilyNotMetered */, false /* isRoaming */);
+    }
+
+    private static NetworkStateSnapshot buildStateOfTransport(int transport, int legacyType,
+            String iface, String subscriberId, String wifiNetworkKey,
             boolean isTemporarilyNotMetered, boolean isRoaming) {
         final LinkProperties prop = new LinkProperties();
         prop.setInterfaceName(iface);
         final NetworkCapabilities capabilities = new NetworkCapabilities();
 
-        if (isTemporarilyNotMetered) {
-            capabilities.addCapability(
-                    NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED);
-        }
+        capabilities.setCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED,
+                isTemporarilyNotMetered);
         capabilities.setCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING, !isRoaming);
-        capabilities.addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR);
+        capabilities.addTransportType(transport);
+        if (legacyType == TYPE_TEST && !TextUtils.isEmpty(wifiNetworkKey)) {
+            capabilities.setNetworkSpecifier(new TestNetworkSpecifier(wifiNetworkKey));
+        }
         return new NetworkStateSnapshot(
-                MOBILE_NETWORK, capabilities, prop, subscriberId, TYPE_MOBILE);
+                MOBILE_NETWORK, capabilities, prop, subscriberId, legacyType);
     }
 
     private NetworkStats buildEmptyStats() {

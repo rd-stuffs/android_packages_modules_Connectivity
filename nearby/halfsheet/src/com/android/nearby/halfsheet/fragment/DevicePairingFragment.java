@@ -33,6 +33,7 @@ import static com.android.nearby.halfsheet.fragment.HalfSheetModuleFragment.Half
 import static com.android.server.nearby.fastpair.Constant.EXTRA_BINDER;
 import static com.android.server.nearby.fastpair.Constant.EXTRA_BUNDLE;
 import static com.android.server.nearby.fastpair.Constant.EXTRA_HALF_SHEET_INFO;
+import static com.android.server.nearby.fastpair.Constant.FAST_PAIR_HALF_SHEET_HELP_URL;
 
 import android.bluetooth.BluetoothDevice;
 import android.content.Intent;
@@ -61,6 +62,7 @@ import com.android.nearby.halfsheet.FastPairUiServiceClient;
 import com.android.nearby.halfsheet.HalfSheetActivity;
 import com.android.nearby.halfsheet.R;
 import com.android.nearby.halfsheet.utils.FastPairUtils;
+import com.android.nearby.halfsheet.utils.HelpUtils;
 import com.android.nearby.halfsheet.utils.IconUtils;
 
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -236,13 +238,12 @@ public class DevicePairingFragment extends HalfSheetModuleFragment implements
         if (icon != null) {
             mImage.setImageBitmap(icon);
         }
-        mConnectButton.setOnClickListener(v -> onConnectClick());
+        mConnectButton.setOnClickListener(v -> onConnectClicked());
         mCancelButton.setOnClickListener(v ->
                 ((HalfSheetActivity) getActivity()).onCancelClicked());
         mSettingsButton.setOnClickListener(v -> onSettingsClicked());
-        mSetupButton.setOnClickListener(v -> onSetupClick());
-        // TODO: Add Listener to info button to open the info page ,
-        // and reset the half-sheet ban state to active
+        mSetupButton.setOnClickListener(v -> onSetupClicked());
+        mInfoIconButton.setOnClickListener(v -> onHelpClicked());
         return rootView;
     }
 
@@ -257,7 +258,14 @@ public class DevicePairingFragment extends HalfSheetModuleFragment implements
     public void onStart() {
         super.onStart();
         Log.v(TAG, "onStart: invalidate states");
-        invalidateState();
+        // If the fragmentState is not NOT_STARTED, it is because the fragment was just resumed from
+        // configuration change (e.g. rotating the screen or half-sheet resurface). Let's recover
+        // the UI directly.
+        if (mFragmentState != NOT_STARTED) {
+            setState(mFragmentState);
+        } else {
+            invalidateState();
+        }
     }
 
     @Override
@@ -273,7 +281,7 @@ public class DevicePairingFragment extends HalfSheetModuleFragment implements
         startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
     }
 
-    private void onSetupClick() {
+    private void onSetupClicked() {
         String companionApp =
                 FastPairUtils.getCompanionAppFromActionUrl(mScanFastPairStoreItem.getActionUrl());
         Intent intent =
@@ -291,7 +299,7 @@ public class DevicePairingFragment extends HalfSheetModuleFragment implements
         }
     }
 
-    private void onConnectClick() {
+    private void onConnectClicked() {
         if (mScanFastPairStoreItem == null) {
             Log.w(TAG, "No pairing related information in half sheet");
             return;
@@ -308,6 +316,12 @@ public class DevicePairingFragment extends HalfSheetModuleFragment implements
                         .setData(FastPairUtils.convertFrom(mScanFastPairStoreItem)
                                 .toByteArray())
                         .build());
+    }
+
+    private void onHelpClicked() {
+        HelpUtils.showHelpPage(getContext(), FAST_PAIR_HALF_SHEET_HELP_URL);
+        ((HalfSheetActivity) getActivity()).sendBanStateResetBroadcast();
+        getActivity().finish();
     }
 
     // Receives callback from service.
@@ -482,8 +496,7 @@ public class DevicePairingFragment extends HalfSheetModuleFragment implements
             case FAILED:
                 return mScanFastPairStoreItem.getFastPairStrings().getPairingFailDescription();
             case PAIRED_UNLAUNCHABLE:
-                getString(R.string.fast_pair_device_ready);
-            // fall through
+                return getString(R.string.fast_pair_device_ready);
             case FOUND_DEVICE:
             case NOT_STARTED:
                 return mScanFastPairStoreItem.getFastPairStrings().getInitialPairingDescription();

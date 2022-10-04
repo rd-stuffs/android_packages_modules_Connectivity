@@ -150,6 +150,9 @@ java_sdk_library {
         "//packages/modules/IPsec/tests/iketests",
         "//packages/modules/NetworkStack/tests:__subpackages__",
         "//packages/modules/Wifi/service/tests/wifitests",
+
+	// Qualcomm specific
+	"//vendor:__subpackages__",
     ],
 }
 

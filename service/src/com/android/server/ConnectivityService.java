@@ -205,7 +205,6 @@ import android.net.resolv.aidl.IDnsResolverUnsolicitedEventListener;
 import android.net.resolv.aidl.Nat64PrefixEventParcel;
 import android.net.resolv.aidl.PrivateDnsValidationEventParcel;
 import android.net.shared.PrivateDnsConfig;
-import android.net.util.MultinetworkPolicyTracker;
 import android.net.wifi.WifiInfo;
 import android.os.BatteryStatsManager;
 import android.os.Binder;
@@ -272,6 +271,7 @@ import com.android.server.connectivity.FullScore;
 import com.android.server.connectivity.KeepaliveTracker;
 import com.android.server.connectivity.LingerMonitor;
 import com.android.server.connectivity.MockableSystemProperties;
+import com.android.server.connectivity.MultinetworkPolicyTracker;
 import com.android.server.connectivity.NetworkAgentInfo;
 import com.android.server.connectivity.NetworkDiagnostics;
 import com.android.server.connectivity.NetworkNotificationManager;
@@ -357,7 +357,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
     // of connectivity (valid, partial, captive portal). If none has been detected after this
     // delay, the stack considers this network bad, which may affect how it's handled in ranking
     // according to config_networkAvoidBadWifi.
-    private static final int INITIAL_EVALUATION_TIMEOUT_MS = 20 * 1000;
+    // Timeout in case the "actively prefer bad wifi" feature is on
+    private static final int ACTIVELY_PREFER_BAD_WIFI_INITIAL_TIMEOUT_MS = 20 * 1000;
+    // Timeout in case the "actively prefer bad wifi" feature is off
+    private static final int DONT_ACTIVELY_PREFER_BAD_WIFI_INITIAL_TIMEOUT_MS = 8 * 1000;
 
     // Default to 30s linger time-out, and 5s for nascent network. Modifiable only for testing.
     private static final String LINGER_DELAY_PROPERTY = "persist.netmon.linger";
@@ -783,7 +786,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
     final ConnectivityDiagnosticsHandler mConnectivityDiagnosticsHandler;
 
     private final DnsManager mDnsManager;
-    private final NetworkRanker mNetworkRanker;
+    @VisibleForTesting
+    final NetworkRanker mNetworkRanker;
 
     private boolean mSystemReady;
     private Intent mInitialBroadcast;
@@ -1417,7 +1421,6 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 new RequestInfoPerUidCounter(MAX_NETWORK_REQUESTS_PER_SYSTEM_UID - 1);
 
         mMetricsLog = logger;
-        mNetworkRanker = new NetworkRanker();
         final NetworkRequest defaultInternetRequest = createDefaultRequest();
         mDefaultRequest = new NetworkRequestInfo(
                 Process.myUid(), defaultInternetRequest, null,
@@ -1538,6 +1541,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
         mMultinetworkPolicyTracker = mDeps.makeMultinetworkPolicyTracker(
                 mContext, mHandler, () -> updateAvoidBadWifi());
+        mNetworkRanker =
+                new NetworkRanker(new NetworkRanker.Configuration(activelyPreferBadWifi()));
+
         mMultinetworkPolicyTracker.start();
 
         mDnsManager = new DnsManager(mContext, mDnsResolver);
@@ -3742,17 +3748,6 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 case EVENT_PROVISIONING_NOTIFICATION: {
                     final boolean visible = toBool(msg.arg1);
                     // If captive portal status has changed, update capabilities or disconnect.
-                    if (nai != null && (visible != nai.captivePortalDetected())) {
-                        nai.setCaptivePortalDetected(visible);
-                        if (visible && ConnectivitySettingsManager.CAPTIVE_PORTAL_MODE_AVOID
-                                == getCaptivePortalMode()) {
-                            if (DBG) log("Avoiding captive portal network: " + nai.toShortString());
-                            nai.onPreventAutomaticReconnect();
-                            teardownUnneededNetwork(nai);
-                            break;
-                        }
-                        updateCapabilitiesForNetwork(nai);
-                    }
                     if (!visible) {
                         // Only clear SIGN_IN and NETWORK_SWITCH notifications here, or else other
                         // notifications belong to the same network may be cleared unexpectedly.
@@ -3790,13 +3785,18 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 @NonNull NetworkAgentInfo nai, int testResult, @NonNull String redirectUrl) {
             final boolean valid = (testResult & NETWORK_VALIDATION_RESULT_VALID) != 0;
             final boolean partial = (testResult & NETWORK_VALIDATION_RESULT_PARTIAL) != 0;
-            final boolean captive = !TextUtils.isEmpty(redirectUrl);
+            final boolean portal = !TextUtils.isEmpty(redirectUrl);
 
             // If there is any kind of working networking, then the NAI has been evaluated
             // once. {@see NetworkAgentInfo#setEvaluated}, which returns whether this is
             // the first time this ever happened.
-            final boolean someConnectivity = (valid || partial || captive);
+            final boolean someConnectivity = (valid || partial || portal);
             final boolean becameEvaluated = someConnectivity && nai.setEvaluated();
+            // Because of b/245893397, if the score is updated when updateCapabilities is called,
+            // any callback that receives onAvailable for that rematch receives an extra caps
+            // callback. To prevent that, update the score in the agent so the updates below won't
+            // see an update to both caps and score at the same time.
+            // TODO : fix b/245893397 and remove this.
             if (becameEvaluated) nai.updateScoreForNetworkAgentUpdate();
 
             if (!valid && shouldIgnoreValidationFailureAfterRoam(nai)) {
@@ -3809,8 +3809,12 @@ public class ConnectivityService extends IConnectivityManager.Stub
 
             final boolean wasValidated = nai.isValidated();
             final boolean wasPartial = nai.partialConnectivity();
-            nai.setPartialConnectivity((testResult & NETWORK_VALIDATION_RESULT_PARTIAL) != 0);
-            final boolean partialConnectivityChanged = (wasPartial != nai.partialConnectivity());
+            final boolean wasPortal = nai.captivePortalDetected();
+            nai.setPartialConnectivity(partial);
+            nai.setCaptivePortalDetected(portal);
+            nai.updateScoreForNetworkAgentUpdate();
+            final boolean partialConnectivityChanged = (wasPartial != partial);
+            final boolean portalChanged = (wasPortal != portal);
 
             if (DBG) {
                 final String logMsg = !TextUtils.isEmpty(redirectUrl)
@@ -3818,7 +3822,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
                         : "";
                 log(nai.toShortString() + " validation " + (valid ? "passed" : "failed") + logMsg);
             }
-            if (valid != nai.isValidated()) {
+            if (valid != wasValidated) {
                 final FullScore oldScore = nai.getScore();
                 nai.setValidated(valid);
                 updateCapabilities(oldScore, nai, nai.networkCapabilities);
@@ -3841,6 +3845,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 }
             } else if (partialConnectivityChanged) {
                 updateCapabilitiesForNetwork(nai);
+            } else if (portalChanged) {
+                if (portal && ConnectivitySettingsManager.CAPTIVE_PORTAL_MODE_AVOID
+                        == getCaptivePortalMode()) {
+                    if (DBG) log("Avoiding captive portal network: " + nai.toShortString());
+                    nai.onPreventAutomaticReconnect();
+                    teardownUnneededNetwork(nai);
+                    return;
+                } else {
+                    updateCapabilitiesForNetwork(nai);
+                }
             } else if (becameEvaluated) {
                 // If valid or partial connectivity changed, updateCapabilities* has
                 // done the rematch.
@@ -5050,6 +5064,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
         return mMultinetworkPolicyTracker.getAvoidBadWifi();
     }
 
+    private boolean activelyPreferBadWifi() {
+        return mMultinetworkPolicyTracker.getActivelyPreferBadWifi();
+    }
+
     /**
      * Return whether the device should maintain continuous, working connectivity by switching away
      * from WiFi networks having no connectivity.
@@ -5065,14 +5083,21 @@ public class ConnectivityService extends IConnectivityManager.Stub
     private void updateAvoidBadWifi() {
         ensureRunningOnConnectivityServiceThread();
         // Agent info scores and offer scores depend on whether cells yields to bad wifi.
+        final boolean avoidBadWifi = avoidBadWifi();
         for (final NetworkAgentInfo nai : mNetworkAgentInfos) {
             nai.updateScoreForNetworkAgentUpdate();
+            if (avoidBadWifi) {
+                // If the device is now avoiding bad wifi, remove notifications that might have
+                // been put up when the device didn't.
+                mNotifier.clearNotification(nai.network.getNetId(), NotificationType.LOST_INTERNET);
+            }
         }
         // UpdateOfferScore will update mNetworkOffers inline, so make a copy first.
         final ArrayList<NetworkOfferInfo> offersToUpdate = new ArrayList<>(mNetworkOffers);
         for (final NetworkOfferInfo noi : offersToUpdate) {
             updateOfferScore(noi.offer);
         }
+        mNetworkRanker.setConfiguration(new NetworkRanker.Configuration(activelyPreferBadWifi()));
         rematchAllNetworksAndRequests();
     }
 
@@ -5088,6 +5113,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
         pw.println("Bad Wi-Fi avoidance: " + avoidBadWifi());
         pw.increaseIndent();
         pw.println("Config restrict:   " + configRestrict);
+        pw.println("Actively prefer:   " + activelyPreferBadWifi());
 
         final String value = mMultinetworkPolicyTracker.getAvoidBadWifiSetting();
         String description;
@@ -5212,6 +5238,16 @@ public class ConnectivityService extends IConnectivityManager.Stub
             // network was found not to have Internet access.
             nai.updateScoreForNetworkAgentUpdate();
             rematchAllNetworksAndRequests();
+
+            // Also, if this is WiFi and it should be preferred actively, now is the time to
+            // prompt the user that they walked past and connected to a bad WiFi.
+            if (nai.networkCapabilities.hasTransport(TRANSPORT_WIFI)
+                    && !avoidBadWifi()
+                    && activelyPreferBadWifi()) {
+                // The notification will be removed if the network validates or disconnects.
+                showNetworkNotification(nai, NotificationType.LOST_INTERNET);
+                return;
+            }
         }
 
         if (!shouldPromptUnvalidated(nai)) return;
@@ -9225,7 +9261,10 @@ public class ConnectivityService extends IConnectivityManager.Stub
                 networkAgent.networkMonitor().notifyNetworkConnected(params.linkProperties,
                         params.networkCapabilities);
             }
-            scheduleEvaluationTimeout(networkAgent.network, INITIAL_EVALUATION_TIMEOUT_MS);
+            final long delay = activelyPreferBadWifi()
+                    ? ACTIVELY_PREFER_BAD_WIFI_INITIAL_TIMEOUT_MS
+                    : DONT_ACTIVELY_PREFER_BAD_WIFI_INITIAL_TIMEOUT_MS;
+            scheduleEvaluationTimeout(networkAgent.network, delay);
 
             // Whether a particular NetworkRequest listen should cause signal strength thresholds to
             // be communicated to a particular NetworkAgent depends only on the network's immutable,
